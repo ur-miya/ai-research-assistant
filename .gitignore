@@ -8,3 +8,8 @@ __pycache__/
 .vscode/
 .idea/
 *.db
+processed_docs.json
+arxiv-metadata-oai-snapshot.json
+arxiv_sample.json
+processed_docs.json
+*.zip
