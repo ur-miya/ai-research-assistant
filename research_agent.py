@@ -160,7 +160,7 @@ def node_generate_answer(state: AgentState) -> AgentState:
 """
     
     steps = state.get("steps", [])
-    #steps.append(f" Сгенерировал ответ")
+    #steps.append(f"Ответ сгенерирован")
     
     return {
         **state,
