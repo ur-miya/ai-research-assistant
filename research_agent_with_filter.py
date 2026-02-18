@@ -5,10 +5,42 @@ import json
 
 from langgraph.graph import StateGraph, END
 
+
 import chromadb
 from sentence_transformers import SentenceTransformer
 
 load_dotenv()
+
+#from langchain_huggingface import HuggingFaceEndpoint
+"""
+llm = HuggingFaceEndpoint(
+    repo_id="mistralai/Mistral-7B-Instruct-v0.2",
+    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+    task="conversational",         
+    temperature=0.3,
+    max_new_tokens=1024,
+)
+"""
+
+from huggingface_hub import InferenceClient
+hf_client = InferenceClient(
+    model="mistralai/Mistral-7B-Instruct-v0.2",
+    token=os.getenv("HUGGINGFACEHUB_API_TOKEN")
+)
+
+def call_huggingface(prompt: str) -> str:
+    try:
+        response = hf_client.chat_completion(
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1024,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Ошибка при вызове Hugging Face: {e}")
+        return ""
 
 TARGET_CATEGORIES = {
     # Machine Learning
@@ -30,7 +62,7 @@ TARGET_CATEGORIES = {
 PRIORITY_CATEGORIES = ['cs.LG', 'cs.AI', 'cs.CL', 'cs.CV', 'cs.NE', 'cs.DB', 'cs.IR', 'stat.ML']
 
 def is_relevant_category(categories_str: str) -> bool:
-    # Проверка, относится ли статья к интересующим нас категориям.
+    # Проверка, относится ли статья к интересующим нас категориям
     if not categories_str:
         return False
     
@@ -144,29 +176,33 @@ tools = ResearchTools()
 def node_plan_research(state: AgentState) -> AgentState:
     original_query = state["original_query"]
     enhanced_query = original_query
-    if any(c in original_query for c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'):
-        keywords = {
-            'нейронн': 'neural network',
-            'сет': 'network',
-            'обучен': 'learning',
-            'искусственн': 'artificial intelligence',
-            'обработк': 'natural language processing',
-            'дистилляц': 'knowledge distillation',
-            'язык': 'language',
-            'текст': 'text',
-        }
-
-        added = []
-        for ru_word, en_term in keywords.items():
-            if ru_word in original_query.lower():
-                enhanced_query += f" {en_term}"
-                added.append(en_term)
-        
-        #if added:
-            #state["steps"] = state.get("steps", []) + [f"Добавлены английские термины: {', '.join(added)}"]
-    
     steps = state.get("steps", [])
-    #steps.append(f"Планирую исследование по запросу: '{enhanced_query}'")
+    
+    if any('а' <= c <= 'я' for c in original_query.lower()):
+        try:
+            prompt = f"Translate the following Russian text to English: '{original_query}'"
+            
+            response = call_huggingface(prompt)
+            enhanced_query = response.strip()
+            steps.append(f"Запрос переведён через Hugging Face: '{enhanced_query}'")
+        except Exception as e:
+            steps.append(f"Hugging Face недоступен: {e}")
+            
+            # Запасной вариант
+            translation_map = {
+                'последние достижения': 'recent advances',
+                'компьютерное зрение': 'computer vision',
+                'нейронные сети': 'neural networks',
+                'машинное обучение': 'machine learning',
+                'глубокое обучение': 'deep learning',
+                'обработка естественного языка': 'natural language processing',
+                'искусственный интеллект': 'artificial intelligence',
+            }
+            
+            translated = original_query.lower()
+            for ru, en in translation_map.items():
+                if ru in translated:
+                    enhanced_query = enhanced_query.replace(ru, en)
     
     return {
         **state,
@@ -179,42 +215,26 @@ def node_search_papers(state: AgentState) -> AgentState:
     papers_json = tools.search_papers(query, n_results=30)
     all_papers = json.loads(papers_json)
     
-    if "error" in all_papers:
-        steps = state.get("steps", [])
-        steps.append(f"Ошибка поиска: {all_papers['error']}")
-        return {
-            **state,
-            "search_results": [],
-            "steps": steps
-        }
-    
     steps = state.get("steps", [])
-    steps.append(f"Найдено {len(all_papers)} статей до фильтрации")
+    if "error" in all_papers:
+        steps.append(f"Ошибка поиска: {all_papers['error']}")
+        return {**state, "search_results": [], "steps": steps}
     
-    return {
-        **state,
-        "search_results": all_papers,
-        "steps": steps
-    }
+    steps.append(f"Найдено {len(all_papers)} статей до фильтрации")
+    return {**state, "search_results": all_papers, "steps": steps}
 
 def node_filter_papers(state: AgentState) -> AgentState:
     all_papers = state["search_results"]
-    
     if not all_papers:
         return {**state, "filtered_results": [], "filter_stats": {}}
     
     relevant_papers = []
-    stats = {
-        'total': len(all_papers),
-        'filtered': 0,
-        'by_category': {}
-    }
+    stats = {'total': len(all_papers), 'filtered': 0, 'by_category': {}}
     
     for paper in all_papers:
         if is_relevant_category(paper['categories']):
             paper['priority'] = get_category_priority(paper['categories'])
             relevant_papers.append(paper)
-            
             cats = paper['categories'].split()
             for cat in cats:
                 if cat in TARGET_CATEGORIES:
@@ -222,14 +242,11 @@ def node_filter_papers(state: AgentState) -> AgentState:
                     stats['by_category'][cat_name] = stats['by_category'].get(cat_name, 0) + 1
     
     relevant_papers.sort(key=lambda x: (x['priority'] * 0.3 + x['relevance'] * 0.7), reverse=True)
-
     filtered_papers = relevant_papers[:10]
-    
     stats['filtered'] = len(filtered_papers)
     
     steps = state.get("steps", [])
     steps.append(f"Отфильтровано {len(filtered_papers)} релевантных статей из {len(all_papers)}")
-    
     if stats['by_category']:
         top_cats = sorted(stats['by_category'].items(), key=lambda x: -x[1])[:3]
         steps.append(f"Основные категории: {', '.join([f'{cat} ({count})' for cat, count in top_cats])}")
@@ -242,75 +259,70 @@ def node_filter_papers(state: AgentState) -> AgentState:
     }
 
 def node_analyze_results(state: AgentState) -> AgentState:
-
     query = state["query"]
     papers = state["filtered_results"]
-    
     if not papers:
         analysis = "По запросу не найдено релевантных статей"
     else:
         analysis = tools.analyze_results(query, papers)
-    
-    steps = state.get("steps", [])
-    # steps.append(f"Проанализировал результаты")
-    
-    return {
-        **state,
-        "analysis": analysis,
-        "steps": steps
-    }
+    return {**state, "analysis": analysis}
 
 def node_generate_answer(state: AgentState) -> AgentState:
     original_query = state["original_query"]
     papers = state["filtered_results"]
     analysis = state["analysis"]
-    stats = state.get("filter_stats", {})
+    steps = state.get("steps", [])
     
     if not papers:
-        answer = f"""По запросу "{original_query}" не найдено релевантных статей"""
+        answer = f"По запросу \"{original_query}\" не найдено релевантных статей"
     else:
-        answer = f"""
-Результаты:
-   Запрос: {original_query}
-{analysis}
-Статьи:
-"""
+        papers_text = ""
+        for i, paper in enumerate(papers[:7]):
+            papers_text += f"""
+Статья {i+1}:
+Название: {paper['title']}
+Категории: {paper['categories']}
+Релевантность: {paper['relevance']}
+Аннотация: {paper['abstract']}
+---\n"""
         
-        for i, paper in enumerate(papers[:5], 1):
-            
-            answer += f"""
-{i}. {paper['title']}
-   - Релевантность: {paper['relevance']}
-   - Категория: {paper['categories']}
-   - Год: {paper['published'][:4]}
-   - Кратко: {paper['abstract'][:200]}...
-"""    
-    steps = state.get("steps", [])
-    #steps.append(f"Ответ сгенерирован")
+        prompt = f"""<s>[INST] You are a research assistant helping a user find scientific articles based on their query.
+User query: "{original_query}"
+
+Found articles (sorted by relevance):
+{papers_text}
+
+Write a clear and structured answer for the user. Include:
+- a brief introduction responding to the query;
+- a list of the most important articles (titles and key ideas);
+- if there are interesting observations about categories or trends, mention them.
+Be helpful, accurate, and do not invent facts not present in the abstracts.
+The answer should be in the same language as the user's query (detect from the query). [/INST]"""
+        
+        try:
+            response = call_huggingface(prompt)
+            answer = response
+            steps.append("Ответ сгенерирован с помощью Hugging Face")
+        except Exception as e:
+            steps.append(f"Ошибка Hugging Face, использован запасной вариант: {e}")
+            answer = f"Не удалось сгенерировать ответ с помощью LLM. Вот сырые результаты:\n\n{analysis}"
     
-    return {
-        **state,
-        "final_answer": answer,
-        "steps": steps
-    }
+    return {**state, "final_answer": answer, "steps": steps}
 
 def create_research_agent():    
     # Инициализация графа
     workflow = StateGraph(AgentState)
-
     workflow.add_node("plan", node_plan_research)
     workflow.add_node("search", node_search_papers)
     workflow.add_node("filter", node_filter_papers)
     workflow.add_node("analyze", node_analyze_results)
     workflow.add_node("generate", node_generate_answer)
-
     workflow.set_entry_point("plan")
     workflow.add_edge("plan", "search")
     workflow.add_edge("search", "filter")
     workflow.add_edge("filter", "analyze")
     workflow.add_edge("analyze", "generate")
     workflow.add_edge("generate", END)
-
     return workflow.compile()
 
 
